@@ -14,6 +14,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import readline
 import re
@@ -21,9 +22,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent if (SCRIPT_DIR.parent / "src").exists() else SCRIPT_DIR
@@ -181,6 +186,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--player",
         help="Audio playback command. Defaults to afplay on macOS, then ffplay if available.",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=9002,
+        help="Port for the local HTTP API started by the interactive shell. Default: 9002",
+    )
+    parser.add_argument(
+        "--no-http",
+        action="store_true",
+        help="Do not start the local HTTP API in interactive shell mode.",
     )
     args = parser.parse_args()
     if args.script and args.text:
@@ -353,6 +369,152 @@ def write_and_play(
                 pass
 
 
+@dataclass
+class HttpContext:
+    args: argparse.Namespace
+    model: Any
+    voice_caches: dict[str, dict[str, Any]]
+    render_lock: threading.Lock
+
+
+def http_output_path(filename: str | None = None) -> Path:
+    output_dir = PROJECT_ROOT / "outputs" / "http"
+    if filename:
+        filename = str(filename)
+        requested = Path(filename).name
+        if requested != filename or requested in {"", ".", ".."}:
+            raise ValueError("filename must be a plain file name, not a path.")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", requested).strip("._")
+        if not safe_name:
+            raise ValueError("filename has no usable characters.")
+        if not safe_name.lower().endswith(".wav"):
+            safe_name = f"{safe_name}.wav"
+        return output_dir / safe_name
+
+    now = time.time()
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    millis = int((now % 1) * 1000)
+    return output_dir / f"speech-{timestamp}-{millis:03d}.wav"
+
+
+def render_http_request(context: HttpContext, payload: dict[str, Any]) -> Path:
+    text = normalize_text(str(payload.get("text", "")))
+    if not text:
+        raise ValueError("text is required.")
+
+    voice_name = str(payload.get("voice") or context.args.voice)
+    if voice_name not in VOICES:
+        raise ValueError(f"Unknown voice: {voice_name}")
+
+    output_path = http_output_path(payload.get("filename"))
+    with context.render_lock:
+        print(f"HTTP rendering with voice: {voice_name}", file=sys.stderr)
+        wav = generate_audio(
+            model=context.model,
+            voice=VOICES[voice_name],
+            text=text,
+            args=context.args,
+            prompt_cache=context.voice_caches.get(voice_name),
+        )
+        return write_and_play(
+            wav=wav,
+            sample_rate=context.model.tts_model.sample_rate,
+            args=context.args,
+            output_path=output_path,
+            fallback_name=voice_name,
+        )
+
+
+def parse_http_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    content_length = int(handler.headers.get("Content-Length", "0"))
+    raw_body = handler.rfile.read(content_length) if content_length else b""
+    body_text = raw_body.decode("utf-8")
+    content_type = handler.headers.get("Content-Type", "")
+
+    if "application/json" in content_type or body_text.lstrip().startswith("{"):
+        try:
+            payload = json.loads(body_text or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON: {exc.msg}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
+
+    form = parse_qs(body_text, keep_blank_values=True)
+    return {key: values[-1] for key, values in form.items()}
+
+
+def send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
+    class SayRequestHandler(BaseHTTPRequestHandler):
+        server_version = "VoxCPMSayHTTP/1.0"
+
+        def log_message(self, format: str, *args: Any) -> None:
+            print(f"HTTP {self.address_string()} - {format % args}", file=sys.stderr)
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                send_json(self, 200, {"ok": True, "model_loaded": True})
+                return
+            if self.path == "/voices":
+                send_json(
+                    self,
+                    200,
+                    {"voices": [{"name": name, "control": VOICES[name].control} for name in sorted(VOICES)]},
+                )
+                return
+            send_json(self, 404, {"error": "Not found. Use GET /health, GET /voices, or POST /say."})
+
+        def do_POST(self) -> None:
+            if self.path != "/say":
+                send_json(self, 404, {"error": "Not found. Use POST /say."})
+                return
+            try:
+                payload = parse_http_payload(self)
+                wav_path = render_http_request(context, payload)
+            except ValueError as exc:
+                send_json(self, 400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                print(f"HTTP error: {exc}", file=sys.stderr)
+                send_json(self, 500, {"error": str(exc)})
+                return
+
+            send_json(self, 200, {"ok": True, "path": str(wav_path)})
+
+    return SayRequestHandler
+
+
+def start_http_server(context: HttpContext, port: int) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_http_handler(context))
+    thread = threading.Thread(target=server.serve_forever, name="voxcpm-say-http", daemon=True)
+    thread.start()
+    actual_port = server.server_address[1]
+    print(f"HTTP API listening on http://127.0.0.1:{actual_port}", file=sys.stderr)
+    print(
+        'POST /say with JSON: {"voice":"global_airport","text":"Hello","filename":"hello.wav"}',
+        file=sys.stderr,
+    )
+    return server
+
+
 def print_repl_help() -> None:
     print(
         "\nCommands:\n"
@@ -384,6 +546,18 @@ def save_history() -> None:
 def run_shell(args: argparse.Namespace) -> None:
     model = load_model(args)
     voice_caches = build_voice_caches(args, model)
+    render_lock = threading.Lock()
+    http_server = None
+    if not args.no_http:
+        http_server = start_http_server(
+            HttpContext(
+                args=args,
+                model=model,
+                voice_caches=voice_caches,
+                render_lock=render_lock,
+            ),
+            args.http_port,
+        )
     player = resolve_player(args.player) if not args.no_play else None
     if player:
         print(f"Audio player: {' '.join(player)}", file=sys.stderr)
@@ -444,23 +618,27 @@ def run_shell(args: argparse.Namespace) -> None:
 
             try:
                 print(f"Rendering with voice: {current_voice.name}", file=sys.stderr)
-                wav = generate_audio(
-                    model=model,
-                    voice=current_voice,
-                    text=text,
-                    args=args,
-                    prompt_cache=voice_caches.get(current_voice.name),
-                )
-                write_and_play(
-                    wav=wav,
-                    sample_rate=model.tts_model.sample_rate,
-                    args=args,
-                    output_path=output_path,
-                    fallback_name=current_voice.name,
-                )
+                with render_lock:
+                    wav = generate_audio(
+                        model=model,
+                        voice=current_voice,
+                        text=text,
+                        args=args,
+                        prompt_cache=voice_caches.get(current_voice.name),
+                    )
+                    write_and_play(
+                        wav=wav,
+                        sample_rate=model.tts_model.sample_rate,
+                        args=args,
+                        output_path=output_path,
+                        fallback_name=current_voice.name,
+                    )
             except Exception as exc:
                 print(f"Error: {exc}", file=sys.stderr)
     finally:
+        if http_server is not None:
+            http_server.shutdown()
+            http_server.server_close()
         save_history()
 
 
