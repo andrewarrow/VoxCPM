@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -640,6 +640,8 @@ def performance_actor_voice(
         str(
             actor.get("identity")
             or actor.get("description")
+            or actor.get("prompt")
+            or actor.get("control")
             or payload.get("actor_identity")
             or payload.get("identity")
             or ""
@@ -860,8 +862,269 @@ def performance_prompt_mode(payload: dict[str, Any]) -> str:
     return mode
 
 
+def payload_mix(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_mix = payload.get("mix")
+    return raw_mix if isinstance(raw_mix, dict) else {}
+
+
+def mix_value(payload: dict[str, Any], key: str, default: Any = None) -> Any:
+    mix = payload_mix(payload)
+    return mix.get(key, payload.get(key, default))
+
+
+def performance_nonverbal_mode(payload: dict[str, Any]) -> str:
+    mode = normalize_text(str(mix_value(payload, "nonverbal_mode", "performed"))).lower()
+    aliases = {
+        "actor": "performed",
+        "voice": "performed",
+        "voiced": "performed",
+        "human": "performed",
+        "real": "performed",
+        "foley": "synthetic",
+        "noise": "synthetic",
+        "none": "silent",
+        "off": "silent",
+        "false": "silent",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"performed", "synthetic", "silent"}:
+        raise ValueError("mix.nonverbal_mode must be performed, synthetic, or silent.")
+    return mode
+
+
+def performance_humanize_enabled(payload: dict[str, Any]) -> bool:
+    value = mix_value(payload, "humanize")
+    return payload_bool(value) if value is not None else False
+
+
+def performance_actor_warmup_enabled(payload: dict[str, Any]) -> bool:
+    value = mix_value(payload, "actor_warmup")
+    return payload_bool(value) if value is not None else False
+
+
+def stable_text_seed(text: str) -> int:
+    seed = 0
+    for index, char in enumerate(text):
+        seed = (seed + (index + 1) * ord(char)) % (2**32)
+    return seed
+
+
+def split_dialogue_phrases(text: str, *, max_chars: int) -> list[str]:
+    raw_pieces = re.findall(r"[^,;:.!?]+[,;:.!?]*|[,;:.!?]+", text)
+    pieces = [normalize_text(piece) for piece in raw_pieces if normalize_text(piece)]
+    if not pieces:
+        return [text]
+
+    phrases: list[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = normalize_text(f"{current} {piece}" if current else piece)
+        if current and len(candidate) > max_chars:
+            phrases.append(current)
+            current = piece
+        else:
+            current = candidate
+
+        strong_break = current.endswith((".", "!", "?"))
+        soft_break = current.endswith((",", ";", ":")) and len(current) >= 24
+        if strong_break or soft_break:
+            phrases.append(current)
+            current = ""
+
+    if current:
+        phrases.append(current)
+
+    split_phrases: list[str] = []
+    for phrase in phrases:
+        if len(phrase) <= max_chars:
+            split_phrases.append(phrase)
+            continue
+        words = phrase.split()
+        chunk: list[str] = []
+        for word in words:
+            candidate = " ".join([*chunk, word])
+            if chunk and len(candidate) > max_chars:
+                split_phrases.append(" ".join(chunk))
+                chunk = [word]
+            else:
+                chunk.append(word)
+        if chunk:
+            split_phrases.append(" ".join(chunk))
+
+    return [phrase for phrase in split_phrases if phrase]
+
+
+def phrase_pause_ms(phrase: str, *, seed: int, index: int) -> int:
+    import random
+
+    rng = random.Random(seed + index * 9973)
+    if phrase.endswith((".", "!", "?")):
+        return rng.randint(320, 560)
+    if phrase.endswith((",", ";", ":")):
+        return rng.randint(170, 340)
+    return rng.randint(120, 260)
+
+
+def humanize_performance_segments(
+    segments: list[PerformanceSegment],
+    payload: dict[str, Any],
+) -> list[PerformanceSegment]:
+    if not performance_humanize_enabled(payload):
+        return segments
+
+    max_chars = payload_int(
+        mix_value(payload, "humanize_max_chars"),
+        default=72,
+        minimum=24,
+        maximum=180,
+        field_name="mix.humanize_max_chars",
+    )
+    humanized: list[PerformanceSegment] = []
+    for segment in segments:
+        if not segment.text or segment.nonverbal or segment.start_ms is not None:
+            humanized.append(segment)
+            continue
+
+        phrases = split_dialogue_phrases(segment.text, max_chars=max_chars)
+        if len(phrases) <= 1:
+            humanized.append(segment)
+            continue
+
+        seed = stable_text_seed(segment.text)
+        for phrase_index, phrase in enumerate(phrases):
+            is_first = phrase_index == 0
+            is_last = phrase_index == len(phrases) - 1
+            humanized.append(
+                replace(
+                    segment,
+                    text=phrase,
+                    pause_before_ms=segment.pause_before_ms if is_first else 0,
+                    pause_after_ms=segment.pause_after_ms
+                    if is_last
+                    else phrase_pause_ms(phrase, seed=seed, index=phrase_index),
+                    overlap_previous_ms=segment.overlap_previous_ms if is_first else 0,
+                    start_ms=segment.start_ms if is_first else None,
+                )
+            )
+
+    return humanized
+
+
+def performed_nonverbal_text(kind: str) -> str:
+    normalized = kind.strip().lower().replace("-", "_")
+    return {
+        "breath": "uh...",
+        "inhale": "uh...",
+        "exhale": "ah...",
+        "sigh": "oh...",
+        "mouth_click": "tsk.",
+        "click": "tsk.",
+        "swallow": "mm.",
+    }.get(normalized, "uh...")
+
+
+def performed_nonverbal_voice(actor_voice: Voice, segment: PerformanceSegment) -> Voice:
+    normalized = (segment.nonverbal or "breath").strip().lower().replace("-", "_")
+    direction = {
+        "breath": "a tiny close-mic breath that is part of the acting, not a sound effect",
+        "inhale": "a small nervous inhale before speaking, intimate and restrained",
+        "exhale": "a quiet exhale that releases tension, short and human",
+        "sigh": "a soft restrained sigh, emotionally specific and not theatrical",
+        "mouth_click": "a tiny dry tsk-like mouth sound, very short and casual",
+        "click": "a tiny dry tsk-like mouth sound, very short and casual",
+        "swallow": "a tight-throated hesitation, like swallowing a feeling before speaking",
+    }.get(normalized, "a tiny natural human vocal reaction")
+    if segment.direction:
+        direction = f"{direction}; {segment.direction}"
+    control = (
+        f"{actor_voice.control} Current beat only: {direction}. "
+        "Do not say stage directions or labels. Keep it subtle, close-mic, and in the same actor identity."
+    )
+    return Voice(
+        name=actor_voice.name,
+        control=normalize_text(control),
+        sample=actor_voice.sample,
+        base_voice=actor_voice.base_voice,
+    )
+
+
+def actor_warmup_text(actor_name: str, actor_voice: Voice, payload: dict[str, Any]) -> str:
+    raw_actors = payload.get("actors")
+    actor_payload: dict[str, Any] = {}
+    if isinstance(raw_actors, dict):
+        raw_actor = raw_actors.get(actor_name)
+        if isinstance(raw_actor, dict):
+            actor_payload = raw_actor
+    elif isinstance(raw_actors, list):
+        for item in raw_actors:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            if normalize_voice_name(str(item.get("name", ""))) == actor_name:
+                actor_payload = item
+                break
+    warmup = normalize_text(str(actor_payload.get("warmup_text") or payload.get("warmup_text") or ""))
+    if warmup:
+        return warmup
+    return "Yeah. I know. Just give me a second."
+
+
+def actor_warmup_voice(actor_voice: Voice, payload: dict[str, Any]) -> Voice:
+    style = normalize_text(str(payload.get("warmup_style") or ""))
+    control = (
+        f"{actor_voice.control} Hidden calibration take for scene acting: casual film dialogue, close microphone, "
+        "unpolished human timing, small imperfections, natural pauses, no announcer cadence."
+    )
+    if style:
+        control = f"{control} {style}"
+    return Voice(
+        name=actor_voice.name,
+        control=normalize_text(control),
+        sample=actor_voice.sample,
+        base_voice=actor_voice.base_voice,
+    )
+
+
 def db_to_gain(db: float) -> float:
     return 10 ** (db / 20)
+
+
+def silence_wav(*, sample_rate: int, duration_ms: int | None) -> Any:
+    import numpy as np
+
+    length = max(1, int(sample_rate * (duration_ms or 250) / 1000))
+    return np.zeros(length, dtype=np.float32)
+
+
+def trim_clip_silence(wav: Any, sample_rate: int, *, threshold_db: float, keep_ms: int) -> Any:
+    import numpy as np
+
+    audio = np.asarray(wav, dtype=np.float32)
+    if len(audio) == 0:
+        return audio
+    threshold = db_to_gain(threshold_db)
+    active = np.flatnonzero(np.abs(audio) > threshold)
+    if len(active) == 0:
+        return audio
+    keep = int(sample_rate * keep_ms / 1000)
+    start = max(0, int(active[0]) - keep)
+    end = min(len(audio), int(active[-1]) + keep)
+    if end <= start:
+        return audio
+    return audio[start:end].copy()
+
+
+def level_speech_clip(wav: Any, *, target_db: float, max_adjust_db: float) -> Any:
+    import numpy as np
+
+    audio = np.asarray(wav, dtype=np.float32).copy()
+    if len(audio) == 0:
+        return audio
+    rms = float(np.sqrt(np.mean(audio * audio)))
+    if rms <= 0:
+        return audio
+    current_db = 20 * np.log10(max(rms, 1e-8))
+    adjust_db = min(max_adjust_db, max(-max_adjust_db, target_db - current_db))
+    return audio * db_to_gain(adjust_db)
 
 
 def apply_clip_shape(wav: Any, sample_rate: int, *, gain_db: float, fade_ms: int) -> Any:
@@ -987,34 +1250,72 @@ def mix_performance_segments(
 ) -> tuple[Any, list[dict[str, Any]]]:
     import numpy as np
 
-    raw_mix = payload.get("mix")
-    mix = raw_mix if isinstance(raw_mix, dict) else {}
+    mix = payload_mix(payload)
     crossfade_ms = payload_int(
-        mix.get("crossfade_ms", payload.get("crossfade_ms")),
+        mix_value(payload, "crossfade_ms"),
         default=18,
         minimum=0,
         maximum=250,
         field_name="mix.crossfade_ms",
     )
-    room_enabled = payload_bool(mix.get("room_tone", payload.get("room_tone")))
+    room_enabled = payload_bool(mix_value(payload, "room_tone"))
     room_level_db = payload_float(
-        mix.get("room_tone_level_db", payload.get("room_tone_level_db")),
+        mix_value(payload, "room_tone_level_db"),
         default=-54.0,
         minimum=-80.0,
         maximum=-24.0,
         field_name="mix.room_tone_level_db",
     )
-    mouth_noises = normalize_text(str(mix.get("mouth_noises", payload.get("mouth_noises") or "off"))).lower()
+    trim_silence_raw = mix_value(payload, "trim_silence")
+    trim_silence_enabled = (
+        payload_bool(trim_silence_raw)
+        if trim_silence_raw is not None
+        else performance_humanize_enabled(payload)
+    )
+    trim_threshold_db = payload_float(
+        mix_value(payload, "trim_threshold_db"),
+        default=-50.0,
+        minimum=-80.0,
+        maximum=-20.0,
+        field_name="mix.trim_threshold_db",
+    )
+    trim_keep_ms = payload_int(
+        mix_value(payload, "trim_keep_ms"),
+        default=45,
+        minimum=0,
+        maximum=500,
+        field_name="mix.trim_keep_ms",
+    )
+    default_line_leveling = "gentle" if performance_humanize_enabled(payload) else "off"
+    line_leveling = normalize_text(str(mix_value(payload, "line_leveling", default_line_leveling))).lower()
+    if line_leveling not in {"off", "false", "none", "gentle"}:
+        raise ValueError("mix.line_leveling must be off or gentle.")
+    line_leveling_enabled = line_leveling == "gentle"
+    target_rms_db = payload_float(
+        mix_value(payload, "target_rms_db"),
+        default=-23.0,
+        minimum=-36.0,
+        maximum=-12.0,
+        field_name="mix.target_rms_db",
+    )
+    max_level_adjust_db = payload_float(
+        mix_value(payload, "max_level_adjust_db"),
+        default=3.5,
+        minimum=0.0,
+        maximum=12.0,
+        field_name="mix.max_level_adjust_db",
+    )
+    mouth_noises = normalize_text(str(mix_value(payload, "mouth_noises", "off"))).lower()
     if mouth_noises not in {"off", "false", "none", "subtle", "medium"}:
         raise ValueError("mix.mouth_noises must be off, subtle, or medium.")
     mouth_probability = 0.0
     mouth_level = 0.0
     if mouth_noises == "subtle":
-        mouth_probability = 0.22
-        mouth_level = 0.055
+        mouth_probability = 0.08
+        mouth_level = 0.018
     elif mouth_noises == "medium":
-        mouth_probability = 0.42
-        mouth_level = 0.095
+        mouth_probability = 0.16
+        mouth_level = 0.026
 
     cursor_ms = 0
     timeline: list[tuple[int, int, RenderedPerformanceSegment, Any]] = []
@@ -1022,8 +1323,23 @@ def mix_performance_segments(
     for rendered in rendered_segments:
         segment = rendered.segment
         clip_fade_ms = min(crossfade_ms, 12) if segment.nonverbal and not segment.text else crossfade_ms
+        raw_wav = rendered.wav
+        if segment.text:
+            if trim_silence_enabled:
+                raw_wav = trim_clip_silence(
+                    raw_wav,
+                    sample_rate,
+                    threshold_db=trim_threshold_db,
+                    keep_ms=trim_keep_ms,
+                )
+            if line_leveling_enabled:
+                raw_wav = level_speech_clip(
+                    raw_wav,
+                    target_db=target_rms_db,
+                    max_adjust_db=max_level_adjust_db,
+                )
         wav = apply_clip_shape(
-            rendered.wav,
+            raw_wav,
             sample_rate,
             gain_db=segment.gain_db,
             fade_ms=clip_fade_ms,
@@ -1087,6 +1403,10 @@ def render_performance(
     if continuity not in {"rolling", "reference", "reset"}:
         raise ValueError("continuity must be rolling, reference, or reset.")
     prompt_mode = performance_prompt_mode(payload)
+    nonverbal_mode = performance_nonverbal_mode(payload)
+    humanize_enabled = performance_humanize_enabled(payload)
+    actor_warmup_enabled = performance_actor_warmup_enabled(payload)
+    segments = humanize_performance_segments(segments, payload)
 
     sample_rate = context.model.tts_model.sample_rate
     rendered_segments: list[RenderedPerformanceSegment] = []
@@ -1097,6 +1417,27 @@ def render_performance(
             actor_name: voice_prompt_cache(context, actor_voice)
             for actor_name, actor_voice in actors.items()
         }
+
+        if actor_warmup_enabled:
+            for actor_name, actor_voice in actors.items():
+                warmup_text = actor_warmup_text(actor_name, actor_voice, payload)
+                warmup_voice = actor_warmup_voice(actor_voice, payload)
+                print(f"HTTP actor warmup with {actor_name}", file=sys.stderr)
+                _, warmup_target_text, warmup_audio_feat = generate_audio_with_features(
+                    model=context.model,
+                    voice=warmup_voice,
+                    text=warmup_text,
+                    args=context.args,
+                    prompt_cache=base_caches.get(actor_name),
+                    apply_voice_prompt=True,
+                )
+                if warmup_audio_feat is not None and hasattr(context.model.tts_model, "merge_prompt_cache"):
+                    base_caches[actor_name] = context.model.tts_model.merge_prompt_cache(
+                        base_caches.get(actor_name),
+                        warmup_target_text,
+                        warmup_audio_feat,
+                    )
+
         rolling_caches = dict(base_caches)
 
         for index, segment in enumerate(segments, start=1):
@@ -1122,12 +1463,26 @@ def render_performance(
                 file=sys.stderr,
             )
             if segment.nonverbal and not segment.text:
-                wav = synthetic_nonverbal(
-                    segment.nonverbal,
-                    sample_rate=sample_rate,
-                    duration_ms=segment.duration_ms,
-                )
-                target_text = ""
+                if nonverbal_mode == "synthetic":
+                    wav = synthetic_nonverbal(
+                        segment.nonverbal,
+                        sample_rate=sample_rate,
+                        duration_ms=segment.duration_ms,
+                    )
+                    target_text = ""
+                elif nonverbal_mode == "silent":
+                    wav = silence_wav(sample_rate=sample_rate, duration_ms=segment.duration_ms)
+                    target_text = ""
+                else:
+                    nonverbal_voice = performed_nonverbal_voice(actor_voice, segment)
+                    wav, target_text, _ = generate_audio_with_features(
+                        model=context.model,
+                        voice=nonverbal_voice,
+                        text=performed_nonverbal_text(segment.nonverbal),
+                        args=context.args,
+                        prompt_cache=prompt_cache,
+                        apply_voice_prompt=True,
+                    )
                 audio_feat = None
             else:
                 wav, target_text, audio_feat = generate_audio_with_features(
@@ -1201,6 +1556,9 @@ def render_performance(
             },
             "continuity": continuity,
             "prompt_mode": prompt_mode,
+            "nonverbal_mode": nonverbal_mode,
+            "humanize": humanize_enabled,
+            "actor_warmup": actor_warmup_enabled,
             "segments": segment_metadata,
         },
     )

@@ -159,7 +159,7 @@ Built-in voices cannot be replaced.
 
 ## Perform A Scene
 
-Use `POST /scene/preview` to render screenplay-style dialogue with multiple actors. This endpoint renders each line as its own take, places the takes on a timeline, supports overlaps, and can add subtle room tone or mouth clicks in the final mix.
+Use `POST /scene/preview` to render screenplay-style dialogue with multiple actors. This endpoint renders lines as actor takes, places the takes on a timeline, supports overlaps, can split long dialogue into phrase-level takes, and can render tiny nonverbal beats through the actor voice instead of fake sound effects.
 
 ```bash
 curl -X POST http://127.0.0.1:9002/scene/preview \
@@ -170,14 +170,18 @@ curl -X POST http://127.0.0.1:9002/scene/preview \
       "david": "noir_detective"
     },
     "continuity": "reference",
-    "prompt_mode": "off",
+    "prompt_mode": "beat",
     "mix": {
+      "humanize": true,
+      "actor_warmup": true,
+      "nonverbal_mode": "performed",
       "room_tone": true,
-      "mouth_noises": "subtle",
+      "mouth_noises": "off",
       "crossfade_ms": 18
     },
     "segments": [
       {"actor":"mara","text":"Please.","pause_after_ms":600},
+      {"actor":"mara","nonverbal":"inhale","pause_after_ms":140},
       {"actor":"david","text":"I am here.","overlap_previous_ms":150}
     ],
     "filename":"scene_preview.wav"
@@ -188,10 +192,15 @@ Useful scene fields:
 
 - `actors`: Object mapping actor names to voices, or actor objects with `voice`, `identity`, and `style`.
 - `segments`: Ordered scene beats. Each beat can include `actor`, `text`, `direction`, `pause_before_ms`, `pause_after_ms`, `overlap_previous_ms`, `start_ms`, and `gain_db`.
-- `prompt_mode`: Defaults to `off`, which sends only dialogue text to VoxCPM so acting directions are not spoken.
+- `prompt_mode`: Defaults to `off`, which sends only dialogue text to VoxCPM so acting directions are not spoken. Use `beat` when you want each segment's direction/emotion/subtext to steer the voice prompt.
 - `continuity`: `reference`, `rolling`, or `reset`. Use `reference` for stable actors; try `rolling` for tighter same-actor continuity across lines.
+- `mix.humanize`: Splits longer lines into phrase-level takes so pauses happen on the timeline instead of hoping the model reads punctuation naturally.
+- `mix.actor_warmup`: Renders a hidden calibration take for each actor and uses it as prompt context. This often helps move built-in narrator voices toward casual film dialogue.
+- `mix.nonverbal_mode`: `performed`, `synthetic`, or `silent`. Use `performed` for realism; it asks the actor voice to render a tiny vocal reaction such as `uh...`, `ah...`, `mm.`, or `tsk.`. Use `synthetic` only for debugging audibility.
+- `mix.line_leveling`: `off` or `gentle`. With `humanize`, this defaults to `gentle` to keep separately rendered phrase takes from jumping in volume.
+- `mix.trim_silence`: Removes leading/trailing generated silence from dialogue clips. With `humanize`, this defaults on so the timeline controls pacing.
 - `mix.room_tone`: Adds low-level room tone under the scene.
-- `mix.mouth_noises`: `off`, `subtle`, or `medium`.
+- `mix.mouth_noises`: `off`, `subtle`, or `medium`. Prefer `off`; automatic synthetic clicks usually sound less real than actor-performed micro-beats.
 - `mix.crossfade_ms`: Adds tiny fades to clips to avoid hard digital cuts.
 - `nonverbal`: A segment may omit `text` and use `nonverbal` instead. Supported values are `breath`, `inhale`, `exhale`, `sigh`, `mouth_click`, `click`, and `swallow`.
 
