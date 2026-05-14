@@ -42,7 +42,8 @@ if SRC_DIR.exists():
 class Voice:
     name: str
     control: str
-    sample: str
+    sample: str | None
+    base_voice: str | None = None
 
     def prompt(self, text: str) -> str:
         return f"({self.control}){text}"
@@ -101,6 +102,96 @@ VOICES = {
         ),
     ]
 }
+BUILTIN_VOICE_NAMES = frozenset(VOICES)
+CUSTOM_VOICES_PATH = PROJECT_ROOT / "outputs" / "http" / "voices.json"
+PREVIEW_TEXT = "This is a preview of the requested voice."
+
+
+def voice_metadata(name: str, voice: Voice) -> dict[str, Any]:
+    return {
+        "name": name,
+        "control": voice.control,
+        "source": "builtin" if name in BUILTIN_VOICE_NAMES else "custom",
+        "base_voice": voice.base_voice,
+        "reference_sample": voice.sample,
+    }
+
+
+def normalize_voice_name(name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_")
+    if not normalized:
+        raise ValueError("voice name has no usable characters.")
+    return normalized
+
+
+def payload_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_custom_voice(payload: dict[str, Any], *, name: str = "preview") -> Voice:
+    base_voice = str(payload.get("base_voice") or "").strip() or None
+    if base_voice is not None:
+        base_voice = normalize_voice_name(base_voice)
+        if base_voice not in VOICES:
+            raise ValueError(f"Unknown base_voice: {base_voice}")
+
+    raw_control = payload.get("control") or payload.get("prompt") or payload.get("description")
+    raw_changes = payload.get("changes") or payload.get("direction")
+    if raw_control:
+        control = normalize_text(str(raw_control))
+    elif raw_changes:
+        changes = normalize_text(str(raw_changes))
+        if base_voice:
+            control = f"{VOICES[base_voice].control}, {changes}"
+        else:
+            control = changes
+    else:
+        raise ValueError("control, prompt, description, or changes is required.")
+
+    if not control:
+        raise ValueError("voice prompt is empty.")
+
+    sample = VOICES[base_voice].sample if base_voice else None
+    return Voice(name=name, control=control, sample=sample, base_voice=base_voice)
+
+
+def load_promoted_voices() -> None:
+    if not CUSTOM_VOICES_PATH.exists():
+        return
+    try:
+        data = json.loads(CUSTOM_VOICES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not load custom voices from {CUSTOM_VOICES_PATH}: {exc}", file=sys.stderr)
+        return
+
+    for item in data.get("voices", []):
+        try:
+            name = normalize_voice_name(str(item["name"]))
+            if name in BUILTIN_VOICE_NAMES:
+                continue
+            voice = build_custom_voice(item, name=name)
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"Skipping invalid custom voice entry: {exc}", file=sys.stderr)
+            continue
+        VOICES[name] = voice
+
+
+def save_promoted_voices() -> None:
+    voices = [
+        {
+            "name": name,
+            "control": voice.control,
+            "base_voice": voice.base_voice,
+        }
+        for name, voice in sorted(VOICES.items())
+        if name not in BUILTIN_VOICE_NAMES
+    ]
+    CUSTOM_VOICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CUSTOM_VOICES_PATH.write_text(json.dumps({"voices": voices}, indent=2) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -267,7 +358,7 @@ def load_model(args: argparse.Namespace) -> Any:
 
 
 def default_reference_audio(args: argparse.Namespace, voice: Voice) -> Path | None:
-    if args.no_reference:
+    if args.no_reference or voice.sample is None:
         return None
     reference_audio = args.reference_audio or args.reference_dir / voice.sample
     reference_audio = reference_audio.expanduser()
@@ -414,7 +505,7 @@ def render_http_request(context: HttpContext, payload: dict[str, Any]) -> Path:
             voice=VOICES[voice_name],
             text=text,
             args=context.args,
-            prompt_cache=context.voice_caches.get(voice_name),
+            prompt_cache=voice_prompt_cache(context, VOICES[voice_name]),
         )
         return write_and_play(
             wav=wav,
@@ -423,6 +514,60 @@ def render_http_request(context: HttpContext, payload: dict[str, Any]) -> Path:
             output_path=output_path,
             fallback_name=voice_name,
         )
+
+
+def voice_prompt_cache(context: HttpContext, voice: Voice) -> dict[str, Any] | None:
+    if voice.name in context.voice_caches:
+        return context.voice_caches[voice.name]
+    if voice.base_voice and voice.base_voice in context.voice_caches:
+        return context.voice_caches[voice.base_voice]
+    return None
+
+
+def render_custom_voice_preview(
+    context: HttpContext,
+    voice: Voice,
+    text: str,
+    filename: str | None,
+) -> Path:
+    text = normalize_text(text)
+    if not text:
+        raise ValueError("text is required.")
+
+    output_path = http_output_path(filename)
+    with context.render_lock:
+        print(f"HTTP preview rendering with voice prompt: {voice.control}", file=sys.stderr)
+        wav = generate_audio(
+            model=context.model,
+            voice=voice,
+            text=text,
+            args=context.args,
+            prompt_cache=voice_prompt_cache(context, voice),
+        )
+        return write_and_play(
+            wav=wav,
+            sample_rate=context.model.tts_model.sample_rate,
+            args=context.args,
+            output_path=output_path,
+            fallback_name=voice.name,
+        )
+
+
+def promote_http_voice(context: HttpContext, payload: dict[str, Any]) -> Voice:
+    raw_name = str(payload.get("name", ""))
+    name = normalize_voice_name(raw_name)
+    replace = payload_bool(payload.get("replace"))
+    if name in BUILTIN_VOICE_NAMES:
+        raise ValueError(f"Cannot replace built-in voice: {name}")
+    if name in VOICES and not replace:
+        raise ValueError(f"Voice already exists: {name}. Pass replace=true to update it.")
+
+    voice = build_custom_voice(payload, name=name)
+    VOICES[name] = voice
+    if voice.base_voice and voice.base_voice in context.voice_caches:
+        context.voice_caches[name] = context.voice_caches[voice.base_voice]
+    save_promoted_voices()
+    return voice
 
 
 def parse_http_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -477,18 +622,62 @@ def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
                 send_json(
                     self,
                     200,
-                    {"voices": [{"name": name, "control": VOICES[name].control} for name in sorted(VOICES)]},
+                    {"voices": [voice_metadata(name, VOICES[name]) for name in sorted(VOICES)]},
                 )
                 return
-            send_json(self, 404, {"error": "Not found. Use GET /health, GET /voices, or POST /say."})
+            send_json(
+                self,
+                404,
+                {
+                    "error": (
+                        "Not found. Use GET /health, GET /voices, POST /say, "
+                        "POST /voices/preview, or POST /voices/promote."
+                    )
+                },
+            )
 
         def do_POST(self) -> None:
-            if self.path != "/say":
-                send_json(self, 404, {"error": "Not found. Use POST /say."})
-                return
             try:
                 payload = parse_http_payload(self)
-                wav_path = render_http_request(context, payload)
+                if self.path == "/say":
+                    wav_path = render_http_request(context, payload)
+                    send_json(self, 200, {"ok": True, "path": str(wav_path)})
+                    return
+
+                if self.path == "/voices/preview":
+                    voice = build_custom_voice(payload)
+                    text = str(payload.get("text") or PREVIEW_TEXT)
+                    wav_path = render_custom_voice_preview(context, voice, text, payload.get("filename"))
+                    send_json(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "path": str(wav_path),
+                            "voice": voice_metadata(voice.name, voice),
+                        },
+                    )
+                    return
+
+                if self.path == "/voices/promote":
+                    voice = promote_http_voice(context, payload)
+                    response: dict[str, Any] = {
+                        "ok": True,
+                        "voice": voice_metadata(voice.name, voice),
+                        "registry": str(CUSTOM_VOICES_PATH),
+                    }
+                    if payload.get("text"):
+                        wav_path = render_custom_voice_preview(
+                            context,
+                            voice,
+                            str(payload["text"]),
+                            payload.get("filename"),
+                        )
+                        response["path"] = str(wav_path)
+                    send_json(self, 200, response)
+                    return
+
+                send_json(self, 404, {"error": "Not found. Use POST /say, /voices/preview, or /voices/promote."})
             except ValueError as exc:
                 send_json(self, 400, {"error": str(exc)})
                 return
@@ -496,8 +685,6 @@ def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
                 print(f"HTTP error: {exc}", file=sys.stderr)
                 send_json(self, 500, {"error": str(exc)})
                 return
-
-            send_json(self, 200, {"ok": True, "path": str(wav_path)})
 
     return SayRequestHandler
 
@@ -510,6 +697,10 @@ def start_http_server(context: HttpContext, port: int) -> ThreadingHTTPServer:
     print(f"HTTP API listening on http://127.0.0.1:{actual_port}", file=sys.stderr)
     print(
         'POST /say with JSON: {"voice":"global_airport","text":"Hello","filename":"hello.wav"}',
+        file=sys.stderr,
+    )
+    print(
+        'POST /voices/preview with JSON: {"base_voice":"global_airport","changes":"warmer and slower","text":"Preview."}',
         file=sys.stderr,
     )
     return server
@@ -648,8 +839,9 @@ def run_once(args: argparse.Namespace, text: str) -> None:
     prompt_cache = None
     if not args.no_reference:
         reference_audio = default_reference_audio(args, voice)
-        print(f"Using reference audio: {reference_audio}", file=sys.stderr)
-        prompt_cache = model.tts_model.build_prompt_cache(reference_wav_path=str(reference_audio))
+        if reference_audio is not None:
+            print(f"Using reference audio: {reference_audio}", file=sys.stderr)
+            prompt_cache = model.tts_model.build_prompt_cache(reference_wav_path=str(reference_audio))
 
     output_path = args.output.expanduser() if args.output else None
     print(f"Rendering with voice: {voice.name}", file=sys.stderr)
@@ -677,8 +869,9 @@ def run_script(args: argparse.Namespace, lines: list[str]) -> None:
     prompt_cache = None
     if not args.no_reference:
         reference_audio = default_reference_audio(args, voice)
-        print(f"Using reference audio: {reference_audio}", file=sys.stderr)
-        prompt_cache = model.tts_model.build_prompt_cache(reference_wav_path=str(reference_audio))
+        if reference_audio is not None:
+            print(f"Using reference audio: {reference_audio}", file=sys.stderr)
+            prompt_cache = model.tts_model.build_prompt_cache(reference_wav_path=str(reference_audio))
 
     sample_rate = model.tts_model.sample_rate
     pause = np.zeros(int(sample_rate * 0.25), dtype=np.float32)
@@ -707,6 +900,7 @@ def run_script(args: argparse.Namespace, lines: list[str]) -> None:
 
 
 def main() -> None:
+    load_promoted_voices()
     args = parse_args()
 
     if args.list_voices:

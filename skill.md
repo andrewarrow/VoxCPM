@@ -77,11 +77,99 @@ outputs/http/
 
 It also plays the WAV when rendering completes, unless the server was started with `--no-play`.
 
+## Try A New Voice
+
+Use `POST /voices/preview` to test a new English voice prompt without saving it as a reusable voice.
+
+Pure voice design, with no reference voice:
+
+```bash
+curl -X POST http://127.0.0.1:9002/voices/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"A calm adult woman with a warm public radio tone, precise diction, relaxed pacing, and gentle authority.","text":"This is a preview of the custom voice.","filename":"preview_radio_warm.wav"}'
+```
+
+Custom changes anchored to an existing voice:
+
+```bash
+curl -X POST http://127.0.0.1:9002/voices/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"base_voice":"global_airport","changes":"warmer, slower, more reassuring, with less announcement stiffness","text":"Flight 42 is now boarding.","filename":"preview_airport_warm.wav"}'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "path": "/Users/aa/os/VoxCPM/outputs/http/preview_airport_warm.wav",
+  "voice": {
+    "name": "preview",
+    "control": "A clear international airport announcement voice..., warmer, slower...",
+    "source": "custom",
+    "base_voice": "global_airport",
+    "reference_sample": "15_global_airport.wav"
+  }
+}
+```
+
+The preview WAV is saved under `outputs/http/` and played when rendering completes.
+
+## Promote A Voice
+
+Use `POST /voices/promote` to save a voice prompt as a named reusable voice. Promoted voices are stored in:
+
+```text
+outputs/http/voices.json
+```
+
+Promote a pure designed voice:
+
+```bash
+curl -X POST http://127.0.0.1:9002/voices/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"warm_radio","description":"A calm adult woman with a warm public radio tone, precise diction, relaxed pacing, and gentle authority."}'
+```
+
+Promote a modified version of an existing voice:
+
+```bash
+curl -X POST http://127.0.0.1:9002/voices/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"warm_airport","base_voice":"global_airport","changes":"warmer, slower, more reassuring, with less announcement stiffness"}'
+```
+
+After promotion, the voice can be reused through `/say`:
+
+```bash
+curl -X POST http://127.0.0.1:9002/say \
+  -H 'Content-Type: application/json' \
+  -d '{"voice":"warm_airport","text":"Flight 42 is now boarding.","filename":"warm_airport_boarding.wav"}'
+```
+
+To update an existing promoted voice, pass `replace:true`:
+
+```bash
+curl -X POST http://127.0.0.1:9002/voices/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"warm_airport","base_voice":"global_airport","changes":"warmer, slower, softer, and more reassuring","replace":true}'
+```
+
+Built-in voices cannot be replaced.
+
 ## Request Fields
 
 - `text`: Required. The text to synthesize.
 - `voice`: Optional. Defaults to the server's current default voice if omitted.
 - `filename`: Optional. Plain output filename. If omitted, the server creates a timestamped name.
+
+For `/voices/preview` and `/voices/promote`:
+
+- `description`, `prompt`, or `control`: Full English voice description.
+- `base_voice`: Optional existing voice to use as the timbre/style anchor.
+- `changes` or `direction`: Optional custom changes to apply to `base_voice`.
+- `name`: Required only for `/voices/promote`.
+- `replace`: Optional boolean for updating an existing promoted voice.
 
 `filename` must be a basename only, not a path. Valid examples:
 
@@ -126,6 +214,9 @@ Common errors:
 
 - Missing or empty `text`.
 - Unknown `voice`.
+- Unknown `base_voice`.
+- Missing voice `description`, `prompt`, `control`, or `changes`.
+- Promoting a voice without `name`.
+- Promoting a voice name that already exists without `replace:true`.
 - `filename` contains a directory path.
 - The server is not running or the model has not finished loading.
-
