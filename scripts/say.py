@@ -49,6 +49,14 @@ class Voice:
         return f"({self.control}){text}"
 
 
+@dataclass(frozen=True)
+class PerformanceSegment:
+    text: str
+    direction: str
+    pause_before_ms: int
+    pause_after_ms: int
+
+
 VOICES = {
     voice.name: voice
     for voice in [
@@ -130,6 +138,23 @@ def payload_bool(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def payload_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    field_name: str,
+) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(float(str(value).strip()))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a number.") from exc
+    return min(maximum, max(minimum, parsed))
 
 
 def build_custom_voice(payload: dict[str, Any], *, name: str = "preview") -> Voice:
@@ -423,6 +448,42 @@ def generate_audio(
     )
 
 
+def generate_audio_with_features(
+    *,
+    model: Any,
+    voice: Voice,
+    text: str,
+    args: argparse.Namespace,
+    prompt_cache: dict[str, Any] | None = None,
+) -> tuple[Any, str, Any | None]:
+    text = normalize_text(text)
+    if not text:
+        raise ValueError("Text is empty.")
+
+    target_text = voice.prompt(text)
+    if hasattr(model.tts_model, "generate_with_prompt_cache"):
+        wav, _, audio_feat = model.tts_model.generate_with_prompt_cache(
+            target_text=target_text,
+            prompt_cache=prompt_cache,
+            cfg_value=args.cfg_value,
+            inference_timesteps=args.inference_timesteps,
+            max_len=args.max_len,
+        )
+        return wav.squeeze(0).cpu().numpy(), target_text, audio_feat
+
+    return (
+        generate_audio(
+            model=model,
+            voice=voice,
+            text=text,
+            args=args,
+            prompt_cache=prompt_cache,
+        ),
+        target_text,
+        None,
+    )
+
+
 def write_and_play(
     *,
     wav,
@@ -522,6 +583,235 @@ def voice_prompt_cache(context: HttpContext, voice: Voice) -> dict[str, Any] | N
     if voice.base_voice and voice.base_voice in context.voice_caches:
         return context.voice_caches[voice.base_voice]
     return None
+
+
+def performance_actor_voice(context: HttpContext, payload: dict[str, Any]) -> Voice:
+    raw_actor = payload.get("actor")
+    actor = raw_actor if isinstance(raw_actor, dict) else {}
+    voice_name = str(
+        actor.get("voice")
+        or payload.get("voice")
+        or payload.get("base_voice")
+        or context.args.voice
+    )
+    voice_name = normalize_voice_name(voice_name)
+    if voice_name not in VOICES:
+        raise ValueError(f"Unknown voice: {voice_name}")
+
+    base_voice = VOICES[voice_name]
+    actor_name = normalize_voice_name(str(actor.get("name") or payload.get("actor_name") or "performance_actor"))
+    identity = normalize_text(
+        str(
+            actor.get("identity")
+            or actor.get("description")
+            or payload.get("actor_identity")
+            or payload.get("identity")
+            or ""
+        )
+    )
+    style = normalize_text(str(actor.get("style") or payload.get("style") or ""))
+
+    control_parts = [
+        "Same actor identity across every rendered beat; keep the same speaker, timbre, age, accent, and microphone distance.",
+        base_voice.control,
+    ]
+    if identity:
+        control_parts.append(f"Actor identity: {identity}")
+    if style:
+        control_parts.append(f"Scene performance style: {style}")
+
+    return Voice(
+        name=actor_name,
+        control=normalize_text(" ".join(control_parts)),
+        sample=base_voice.sample,
+        base_voice=voice_name,
+    )
+
+
+def performance_segments(payload: dict[str, Any]) -> list[PerformanceSegment]:
+    raw_segments = payload.get("segments")
+    if raw_segments is None:
+        raw_text = normalize_text(str(payload.get("text", "")))
+        if not raw_text:
+            raise ValueError("segments or text is required.")
+        raw_segments = [{"text": item} for item in split_performance_text(raw_text)]
+
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise ValueError("segments must be a non-empty list.")
+
+    default_pause_ms = payload_int(
+        payload.get("default_pause_ms"),
+        default=450,
+        minimum=0,
+        maximum=5000,
+        field_name="default_pause_ms",
+    )
+    segments: list[PerformanceSegment] = []
+    total = len(raw_segments)
+    for index, raw_segment in enumerate(raw_segments):
+        segment_payload: dict[str, Any]
+        if isinstance(raw_segment, str):
+            segment_payload = {"text": raw_segment}
+        elif isinstance(raw_segment, dict):
+            segment_payload = raw_segment
+        else:
+            raise ValueError("Each segment must be a string or object.")
+
+        text = normalize_text(str(segment_payload.get("text", "")))
+        if not text:
+            raise ValueError(f"Segment {index + 1} text is required.")
+
+        pause_after_default = 0 if index == total - 1 else default_pause_ms
+        pause_after_raw = segment_payload.get("pause_after_ms", segment_payload.get("pause_ms"))
+        pause_before_ms = payload_int(
+            segment_payload.get("pause_before_ms"),
+            default=0,
+            minimum=0,
+            maximum=5000,
+            field_name=f"segments[{index}].pause_before_ms",
+        )
+        pause_after_ms = payload_int(
+            pause_after_raw,
+            default=pause_after_default,
+            minimum=0,
+            maximum=5000,
+            field_name=f"segments[{index}].pause_after_ms",
+        )
+        direction = performance_segment_direction(segment_payload)
+        segments.append(
+            PerformanceSegment(
+                text=text,
+                direction=direction,
+                pause_before_ms=pause_before_ms,
+                pause_after_ms=pause_after_ms,
+            )
+        )
+
+    return segments
+
+
+def split_performance_text(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[.!?])\s+", text)
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def performance_segment_direction(segment: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, label in [
+        ("direction", "Acting direction"),
+        ("acting", "Acting direction"),
+        ("emotion", "Emotion"),
+        ("subtext", "Subtext"),
+        ("pace", "Pace"),
+        ("breath", "Breath"),
+        ("volume", "Volume"),
+    ]:
+        value = normalize_text(str(segment.get(key, "")))
+        if value:
+            parts.append(f"{label}: {value}")
+    return " ".join(parts)
+
+
+def performance_segment_voice(actor_voice: Voice, segment: PerformanceSegment) -> Voice:
+    control = actor_voice.control
+    if segment.direction:
+        control = (
+            f"{control} Current beat only: {segment.direction} "
+            "Do not change into a different person; change only this beat's emotion, pace, breath, and intention."
+        )
+    return Voice(
+        name=actor_voice.name,
+        control=normalize_text(control),
+        sample=actor_voice.sample,
+        base_voice=actor_voice.base_voice,
+    )
+
+
+def render_performance_preview(context: HttpContext, payload: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    import numpy as np
+
+    actor_voice = performance_actor_voice(context, payload)
+    segments = performance_segments(payload)
+    continuity = normalize_text(str(payload.get("continuity") or "rolling")).lower()
+    if continuity not in {"rolling", "reference", "reset"}:
+        raise ValueError("continuity must be rolling, reference, or reset.")
+
+    output_path = http_output_path(payload.get("filename"))
+    sample_rate = context.model.tts_model.sample_rate
+    chunks: list[Any] = []
+    segment_metadata: list[dict[str, Any]] = []
+
+    with context.render_lock:
+        base_cache = voice_prompt_cache(context, actor_voice)
+        rolling_cache = base_cache
+        for index, segment in enumerate(segments, start=1):
+            if segment.pause_before_ms:
+                chunks.append(np.zeros(int(sample_rate * segment.pause_before_ms / 1000), dtype=np.float32))
+
+            if continuity == "rolling":
+                prompt_cache = rolling_cache
+            elif continuity == "reference":
+                prompt_cache = base_cache
+            else:
+                prompt_cache = None
+
+            segment_voice = performance_segment_voice(actor_voice, segment)
+            print(
+                f"HTTP performance segment {index}/{len(segments)} with {actor_voice.name}",
+                file=sys.stderr,
+            )
+            wav, target_text, audio_feat = generate_audio_with_features(
+                model=context.model,
+                voice=segment_voice,
+                text=segment.text,
+                args=context.args,
+                prompt_cache=prompt_cache,
+            )
+            chunks.append(np.asarray(wav, dtype=np.float32))
+
+            if (
+                continuity == "rolling"
+                and audio_feat is not None
+                and hasattr(context.model.tts_model, "merge_prompt_cache")
+            ):
+                rolling_cache = context.model.tts_model.merge_prompt_cache(
+                    rolling_cache,
+                    target_text,
+                    audio_feat,
+                )
+
+            if segment.pause_after_ms:
+                chunks.append(np.zeros(int(sample_rate * segment.pause_after_ms / 1000), dtype=np.float32))
+
+            segment_metadata.append(
+                {
+                    "index": index,
+                    "text": segment.text,
+                    "direction": segment.direction,
+                    "pause_before_ms": segment.pause_before_ms,
+                    "pause_after_ms": segment.pause_after_ms,
+                }
+            )
+
+        if not chunks:
+            raise ValueError("No renderable performance segments.")
+
+        wav_path = write_and_play(
+            wav=np.concatenate(chunks),
+            sample_rate=sample_rate,
+            args=context.args,
+            output_path=output_path,
+            fallback_name=actor_voice.name,
+        )
+
+    return (
+        wav_path,
+        {
+            "actor": voice_metadata(actor_voice.name, actor_voice),
+            "continuity": continuity,
+            "segments": segment_metadata,
+        },
+    )
 
 
 def render_custom_voice_preview(
@@ -631,7 +921,7 @@ def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
                 {
                     "error": (
                         "Not found. Use GET /health, GET /voices, POST /say, "
-                        "POST /voices/preview, or POST /voices/promote."
+                        "POST /perform/preview, POST /voices/preview, or POST /voices/promote."
                     )
                 },
             )
@@ -642,6 +932,19 @@ def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
                 if self.path == "/say":
                     wav_path = render_http_request(context, payload)
                     send_json(self, 200, {"ok": True, "path": str(wav_path)})
+                    return
+
+                if self.path in {"/perform/preview", "/perform/say"}:
+                    wav_path, performance = render_performance_preview(context, payload)
+                    send_json(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "path": str(wav_path),
+                            "performance": performance,
+                        },
+                    )
                     return
 
                 if self.path == "/voices/preview":
@@ -677,7 +980,11 @@ def make_http_handler(context: HttpContext) -> type[BaseHTTPRequestHandler]:
                     send_json(self, 200, response)
                     return
 
-                send_json(self, 404, {"error": "Not found. Use POST /say, /voices/preview, or /voices/promote."})
+                send_json(
+                    self,
+                    404,
+                    {"error": "Not found. Use POST /say, /perform/preview, /voices/preview, or /voices/promote."},
+                )
             except ValueError as exc:
                 send_json(self, 400, {"error": str(exc)})
                 return
@@ -701,6 +1008,10 @@ def start_http_server(context: HttpContext, port: int) -> ThreadingHTTPServer:
     )
     print(
         'POST /voices/preview with JSON: {"base_voice":"global_airport","changes":"warmer and slower","text":"Preview."}',
+        file=sys.stderr,
+    )
+    print(
+        'POST /perform/preview with JSON: {"actor":{"voice":"friendly_support","identity":"naturalistic film actor"},"segments":[{"text":"Please.","direction":"whispered, afraid","pause_after_ms":700}]}',
         file=sys.stderr,
     )
     return server
