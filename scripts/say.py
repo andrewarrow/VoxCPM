@@ -56,6 +56,18 @@ class PerformanceSegment:
     direction: str
     pause_before_ms: int
     pause_after_ms: int
+    overlap_previous_ms: int
+    start_ms: int | None
+    gain_db: float
+    nonverbal: str | None
+    duration_ms: int | None
+
+
+@dataclass(frozen=True)
+class RenderedPerformanceSegment:
+    segment: PerformanceSegment
+    actor: str
+    wav: Any
 
 
 VOICES = {
@@ -153,6 +165,23 @@ def payload_int(
         return default
     try:
         parsed = int(float(str(value).strip()))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a number.") from exc
+    return min(maximum, max(minimum, parsed))
+
+
+def payload_float(
+    value: Any,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+    field_name: str,
+) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(str(value).strip())
     except ValueError as exc:
         raise ValueError(f"{field_name} must be a number.") from exc
     return min(maximum, max(minimum, parsed))
@@ -703,8 +732,9 @@ def performance_segments(payload: dict[str, Any], *, require_actor: bool = False
             raise ValueError("Each segment must be a string or object.")
 
         text = normalize_text(str(segment_payload.get("text", "")))
-        if not text:
-            raise ValueError(f"Segment {index + 1} text is required.")
+        nonverbal = normalize_text(str(segment_payload.get("nonverbal", ""))).lower() or None
+        if not text and not nonverbal:
+            raise ValueError(f"Segment {index + 1} text or nonverbal is required.")
         actor_name = segment_payload.get("actor") or segment_payload.get("speaker")
         normalized_actor = normalize_voice_name(str(actor_name)) if actor_name else None
         if require_actor and not normalized_actor:
@@ -726,6 +756,38 @@ def performance_segments(payload: dict[str, Any], *, require_actor: bool = False
             maximum=5000,
             field_name=f"segments[{index}].pause_after_ms",
         )
+        overlap_previous_ms = payload_int(
+            segment_payload.get("overlap_previous_ms"),
+            default=0,
+            minimum=0,
+            maximum=5000,
+            field_name=f"segments[{index}].overlap_previous_ms",
+        )
+        start_ms = None
+        if segment_payload.get("start_ms") is not None:
+            start_ms = payload_int(
+                segment_payload.get("start_ms"),
+                default=0,
+                minimum=0,
+                maximum=3_600_000,
+                field_name=f"segments[{index}].start_ms",
+            )
+        gain_db = payload_float(
+            segment_payload.get("gain_db"),
+            default=0.0,
+            minimum=-36.0,
+            maximum=12.0,
+            field_name=f"segments[{index}].gain_db",
+        )
+        duration_ms = None
+        if segment_payload.get("duration_ms") is not None:
+            duration_ms = payload_int(
+                segment_payload.get("duration_ms"),
+                default=250,
+                minimum=20,
+                maximum=5000,
+                field_name=f"segments[{index}].duration_ms",
+            )
         direction = performance_segment_direction(segment_payload)
         segments.append(
             PerformanceSegment(
@@ -734,6 +796,11 @@ def performance_segments(payload: dict[str, Any], *, require_actor: bool = False
                 direction=direction,
                 pause_before_ms=pause_before_ms,
                 pause_after_ms=pause_after_ms,
+                overlap_previous_ms=overlap_previous_ms,
+                start_ms=start_ms,
+                gain_db=gain_db,
+                nonverbal=nonverbal,
+                duration_ms=duration_ms,
             )
         )
 
@@ -793,6 +860,183 @@ def performance_prompt_mode(payload: dict[str, Any]) -> str:
     return mode
 
 
+def db_to_gain(db: float) -> float:
+    return 10 ** (db / 20)
+
+
+def apply_clip_shape(wav: Any, sample_rate: int, *, gain_db: float, fade_ms: int) -> Any:
+    import numpy as np
+
+    shaped = np.asarray(wav, dtype=np.float32).copy()
+    shaped *= db_to_gain(gain_db)
+
+    fade_samples = min(len(shaped) // 2, int(sample_rate * fade_ms / 1000))
+    if fade_samples > 1:
+        fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        shaped[:fade_samples] *= fade_in
+        shaped[-fade_samples:] *= fade_out
+
+    return shaped
+
+
+def synthetic_nonverbal(kind: str, *, sample_rate: int, duration_ms: int | None) -> Any:
+    import numpy as np
+
+    normalized = kind.strip().lower().replace("-", "_")
+    default_ms = {
+        "breath": 360,
+        "inhale": 300,
+        "exhale": 420,
+        "sigh": 700,
+        "mouth_click": 90,
+        "click": 70,
+        "swallow": 220,
+    }.get(normalized)
+    if default_ms is None:
+        raise ValueError(f"Unknown nonverbal: {kind}")
+
+    length = max(1, int(sample_rate * (duration_ms or default_ms) / 1000))
+    rng = np.random.default_rng(abs(hash((normalized, length))) % (2**32))
+
+    if normalized in {"mouth_click", "click"}:
+        wav = np.zeros(length, dtype=np.float32)
+        burst = min(length, max(12, int(sample_rate * 0.012)))
+        envelope = np.linspace(1.0, 0.0, burst, dtype=np.float32) ** 2
+        wav[:burst] = rng.normal(0, 0.018, burst).astype(np.float32) * envelope
+        return wav
+
+    noise = rng.normal(0, 1.0, length).astype(np.float32)
+    smoothing = max(8, int(sample_rate * 0.006))
+    kernel = np.ones(smoothing, dtype=np.float32) / smoothing
+    wav = np.convolve(noise, kernel, mode="same").astype(np.float32)
+    envelope = np.sin(np.linspace(0.0, np.pi, length, dtype=np.float32))
+
+    if normalized in {"breath", "inhale"}:
+        level = 0.010
+    elif normalized in {"exhale", "sigh"}:
+        level = 0.014
+    else:
+        level = 0.008
+
+    return wav * envelope * level
+
+
+def add_mouth_click(output: Any, *, sample_rate: int, start_sample: int, level: float) -> None:
+    click = synthetic_nonverbal("mouth_click", sample_rate=sample_rate, duration_ms=80) * (level / 0.018)
+    position = max(0, start_sample - int(sample_rate * 0.055))
+    end = min(len(output), position + len(click))
+    if end > position:
+        output[position:end] += click[: end - position]
+
+
+def room_tone(sample_count: int, *, level_db: float) -> Any:
+    import numpy as np
+
+    if sample_count <= 0:
+        return np.zeros(0, dtype=np.float32)
+    rng = np.random.default_rng(41)
+    white = rng.normal(0, 1.0, sample_count).astype(np.float32)
+    smoothing = 96
+    kernel = np.ones(smoothing, dtype=np.float32) / smoothing
+    low = np.convolve(white, kernel, mode="same").astype(np.float32)
+    peak = float(np.max(np.abs(low))) or 1.0
+    return (low / peak) * db_to_gain(level_db)
+
+
+def mix_performance_segments(
+    rendered_segments: list[RenderedPerformanceSegment],
+    *,
+    sample_rate: int,
+    payload: dict[str, Any],
+) -> tuple[Any, list[dict[str, Any]]]:
+    import numpy as np
+
+    raw_mix = payload.get("mix")
+    mix = raw_mix if isinstance(raw_mix, dict) else {}
+    crossfade_ms = payload_int(
+        mix.get("crossfade_ms", payload.get("crossfade_ms")),
+        default=18,
+        minimum=0,
+        maximum=250,
+        field_name="mix.crossfade_ms",
+    )
+    room_enabled = payload_bool(mix.get("room_tone", payload.get("room_tone")))
+    room_level_db = payload_float(
+        mix.get("room_tone_level_db", payload.get("room_tone_level_db")),
+        default=-54.0,
+        minimum=-80.0,
+        maximum=-24.0,
+        field_name="mix.room_tone_level_db",
+    )
+    mouth_noises = normalize_text(str(mix.get("mouth_noises", payload.get("mouth_noises") or "off"))).lower()
+    if mouth_noises not in {"off", "false", "none", "subtle", "medium"}:
+        raise ValueError("mix.mouth_noises must be off, subtle, or medium.")
+    mouth_probability = 0.0
+    mouth_level = 0.0
+    if mouth_noises == "subtle":
+        mouth_probability = 0.22
+        mouth_level = 0.010
+    elif mouth_noises == "medium":
+        mouth_probability = 0.42
+        mouth_level = 0.014
+
+    cursor_ms = 0
+    timeline: list[tuple[int, int, RenderedPerformanceSegment, Any]] = []
+    metadata: list[dict[str, Any]] = []
+    for rendered in rendered_segments:
+        segment = rendered.segment
+        wav = apply_clip_shape(
+            rendered.wav,
+            sample_rate,
+            gain_db=segment.gain_db,
+            fade_ms=crossfade_ms,
+        )
+        duration_ms = int(round(len(wav) * 1000 / sample_rate))
+        if segment.start_ms is not None:
+            start_ms = segment.start_ms
+        else:
+            start_ms = max(0, cursor_ms + segment.pause_before_ms - segment.overlap_previous_ms)
+        end_ms = start_ms + duration_ms
+        cursor_ms = max(cursor_ms, end_ms) + segment.pause_after_ms
+        timeline.append((start_ms, end_ms, rendered, wav))
+        metadata.append(
+            {
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "duration_ms": duration_ms,
+            }
+        )
+
+    total_samples = max((int(end_ms * sample_rate / 1000) for _, end_ms, _, _ in timeline), default=0)
+    output = np.zeros(total_samples, dtype=np.float32)
+    if room_enabled:
+        output += room_tone(total_samples, level_db=room_level_db)
+
+    rng = np.random.default_rng(29)
+    for index, (start_ms, _end_ms, rendered, wav) in enumerate(timeline):
+        start_sample = int(start_ms * sample_rate / 1000)
+        end_sample = min(len(output), start_sample + len(wav))
+        if end_sample <= start_sample:
+            continue
+        output[start_sample:end_sample] += wav[: end_sample - start_sample]
+        if (
+            mouth_probability > 0
+            and rendered.segment.text
+            and start_sample > 0
+            and rng.random() < mouth_probability
+        ):
+            add_mouth_click(output, sample_rate=sample_rate, start_sample=start_sample, level=mouth_level)
+        metadata[index]["start_sample"] = start_sample
+        metadata[index]["end_sample"] = end_sample
+
+    peak = float(np.max(np.abs(output))) if len(output) else 0.0
+    if peak > 0.98:
+        output = output * (0.98 / peak)
+
+    return output, metadata
+
+
 def render_performance(
     context: HttpContext,
     payload: dict[str, Any],
@@ -808,9 +1052,8 @@ def render_performance(
         raise ValueError("continuity must be rolling, reference, or reset.")
     prompt_mode = performance_prompt_mode(payload)
 
-    output_path = http_output_path(payload.get("filename"))
     sample_rate = context.model.tts_model.sample_rate
-    chunks: list[Any] = []
+    rendered_segments: list[RenderedPerformanceSegment] = []
     segment_metadata: list[dict[str, Any]] = []
 
     with context.render_lock:
@@ -828,9 +1071,6 @@ def render_performance(
                 raise ValueError(f"Segment {index} references unknown actor: {actor_name}")
             actor_voice = actors[actor_name]
 
-            if segment.pause_before_ms:
-                chunks.append(np.zeros(int(sample_rate * segment.pause_before_ms / 1000), dtype=np.float32))
-
             if continuity == "rolling":
                 prompt_cache = rolling_caches.get(actor_name)
             elif continuity == "reference":
@@ -845,15 +1085,30 @@ def render_performance(
                 f"HTTP performance segment {index}/{len(segments)} with {actor_name}",
                 file=sys.stderr,
             )
-            wav, target_text, audio_feat = generate_audio_with_features(
-                model=context.model,
-                voice=segment_voice,
-                text=segment.text,
-                args=context.args,
-                prompt_cache=prompt_cache,
-                apply_voice_prompt=prompt_mode != "off",
+            if segment.nonverbal and not segment.text:
+                wav = synthetic_nonverbal(
+                    segment.nonverbal,
+                    sample_rate=sample_rate,
+                    duration_ms=segment.duration_ms,
+                )
+                target_text = ""
+                audio_feat = None
+            else:
+                wav, target_text, audio_feat = generate_audio_with_features(
+                    model=context.model,
+                    voice=segment_voice,
+                    text=segment.text,
+                    args=context.args,
+                    prompt_cache=prompt_cache,
+                    apply_voice_prompt=prompt_mode != "off",
+                )
+            rendered_segments.append(
+                RenderedPerformanceSegment(
+                    segment=segment,
+                    actor=actor_name,
+                    wav=wav,
+                )
             )
-            chunks.append(np.asarray(wav, dtype=np.float32))
 
             if (
                 continuity == "rolling"
@@ -866,29 +1121,38 @@ def render_performance(
                     audio_feat,
                 )
 
-            if segment.pause_after_ms:
-                chunks.append(np.zeros(int(sample_rate * segment.pause_after_ms / 1000), dtype=np.float32))
-
             segment_metadata.append(
                 {
                     "index": index,
                     "actor": actor_name,
                     "text": segment.text,
                     "direction": segment.direction,
+                    "nonverbal": segment.nonverbal,
                     "pause_before_ms": segment.pause_before_ms,
                     "pause_after_ms": segment.pause_after_ms,
+                    "overlap_previous_ms": segment.overlap_previous_ms,
+                    "start_ms": segment.start_ms,
+                    "gain_db": segment.gain_db,
                 }
             )
 
-        if not chunks:
+        if not rendered_segments:
             raise ValueError("No renderable performance segments.")
+
+        mixed_wav, timeline_metadata = mix_performance_segments(
+            rendered_segments,
+            sample_rate=sample_rate,
+            payload=payload,
+        )
+        for metadata_item, timeline_item in zip(segment_metadata, timeline_metadata):
+            metadata_item.update(timeline_item)
 
         fallback_name = default_actor_name or "scene"
         wav_path = write_and_play(
-            wav=np.concatenate(chunks),
+            wav=mixed_wav,
             sample_rate=sample_rate,
             args=context.args,
-            output_path=output_path,
+            output_path=http_output_path(payload.get("filename")),
             fallback_name=fallback_name,
         )
 

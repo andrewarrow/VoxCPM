@@ -157,6 +157,46 @@ curl -X POST http://127.0.0.1:9002/voices/promote \
 
 Built-in voices cannot be replaced.
 
+## Perform A Scene
+
+Use `POST /scene/preview` to render screenplay-style dialogue with multiple actors. This endpoint renders each line as its own take, places the takes on a timeline, supports overlaps, and can add subtle room tone or mouth clicks in the final mix.
+
+```bash
+curl -X POST http://127.0.0.1:9002/scene/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actors": {
+      "mara": "friendly_support",
+      "david": "noir_detective"
+    },
+    "continuity": "reference",
+    "prompt_mode": "off",
+    "mix": {
+      "room_tone": true,
+      "mouth_noises": "subtle",
+      "crossfade_ms": 18
+    },
+    "segments": [
+      {"actor":"mara","text":"Please.","pause_after_ms":600},
+      {"actor":"david","text":"I am here.","overlap_previous_ms":150}
+    ],
+    "filename":"scene_preview.wav"
+  }'
+```
+
+Useful scene fields:
+
+- `actors`: Object mapping actor names to voices, or actor objects with `voice`, `identity`, and `style`.
+- `segments`: Ordered scene beats. Each beat can include `actor`, `text`, `direction`, `pause_before_ms`, `pause_after_ms`, `overlap_previous_ms`, `start_ms`, and `gain_db`.
+- `prompt_mode`: Defaults to `off`, which sends only dialogue text to VoxCPM so acting directions are not spoken.
+- `continuity`: `reference`, `rolling`, or `reset`. Use `reference` for stable actors; try `rolling` for tighter same-actor continuity across lines.
+- `mix.room_tone`: Adds low-level room tone under the scene.
+- `mix.mouth_noises`: `off`, `subtle`, or `medium`.
+- `mix.crossfade_ms`: Adds tiny fades to clips to avoid hard digital cuts.
+- `nonverbal`: A segment may omit `text` and use `nonverbal` instead. Supported values are `breath`, `inhale`, `exhale`, `sigh`, `mouth_click`, `click`, and `swallow`.
+
+`POST /perform/preview` uses the same renderer for a single actor.
+
 ## Request Fields
 
 - `text`: Required. The text to synthesize.
