@@ -1421,15 +1421,14 @@ def render_performance(
         if actor_warmup_enabled:
             for actor_name, actor_voice in actors.items():
                 warmup_text = actor_warmup_text(actor_name, actor_voice, payload)
-                warmup_voice = actor_warmup_voice(actor_voice, payload)
                 print(f"HTTP actor warmup with {actor_name}", file=sys.stderr)
                 _, warmup_target_text, warmup_audio_feat = generate_audio_with_features(
                     model=context.model,
-                    voice=warmup_voice,
+                    voice=actor_voice,
                     text=warmup_text,
                     args=context.args,
                     prompt_cache=base_caches.get(actor_name),
-                    apply_voice_prompt=True,
+                    apply_voice_prompt=False,
                 )
                 if warmup_audio_feat is not None and hasattr(context.model.tts_model, "merge_prompt_cache"):
                     base_caches[actor_name] = context.model.tts_model.merge_prompt_cache(
@@ -1455,9 +1454,6 @@ def render_performance(
             else:
                 prompt_cache = None
 
-            segment_voice = actor_voice
-            if prompt_mode == "beat":
-                segment_voice = performance_segment_voice(actor_voice, segment)
             print(
                 f"HTTP performance segment {index}/{len(segments)} with {actor_name}",
                 file=sys.stderr,
@@ -1474,24 +1470,23 @@ def render_performance(
                     wav = silence_wav(sample_rate=sample_rate, duration_ms=segment.duration_ms)
                     target_text = ""
                 else:
-                    nonverbal_voice = performed_nonverbal_voice(actor_voice, segment)
                     wav, target_text, _ = generate_audio_with_features(
                         model=context.model,
-                        voice=nonverbal_voice,
+                        voice=actor_voice,
                         text=performed_nonverbal_text(segment.nonverbal),
                         args=context.args,
                         prompt_cache=prompt_cache,
-                        apply_voice_prompt=True,
+                        apply_voice_prompt=False,
                     )
                 audio_feat = None
             else:
                 wav, target_text, audio_feat = generate_audio_with_features(
                     model=context.model,
-                    voice=segment_voice,
+                    voice=actor_voice,
                     text=segment.text,
                     args=context.args,
                     prompt_cache=prompt_cache,
-                    apply_voice_prompt=prompt_mode != "off",
+                    apply_voice_prompt=False,
                 )
             rendered_segments.append(
                 RenderedPerformanceSegment(
@@ -1556,6 +1551,7 @@ def render_performance(
             },
             "continuity": continuity,
             "prompt_mode": prompt_mode,
+            "prompt_text_applied": False,
             "nonverbal_mode": nonverbal_mode,
             "humanize": humanize_enabled,
             "actor_warmup": actor_warmup_enabled,

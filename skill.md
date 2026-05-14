@@ -192,7 +192,7 @@ Useful scene fields:
 
 - `actors`: Object mapping actor names to voices, or actor objects with `voice`, `identity`, and `style`.
 - `segments`: Ordered scene beats. Each beat can include `actor`, `text`, `direction`, `pause_before_ms`, `pause_after_ms`, `overlap_previous_ms`, `start_ms`, and `gain_db`.
-- `prompt_mode`: Defaults to `off`, which sends only dialogue text to VoxCPM so acting directions are not spoken. Use `beat` when you want each segment's direction/emotion/subtext to steer the voice prompt.
+- `prompt_mode`: Accepted for metadata compatibility, but scene/performance rendering keeps prompt text out of `target_text` because VoxCPM can speak parenthetical instructions. Write performable text directly in `segments[].text` using punctuation, sentence fragments, and pauses instead of relying on hidden stage directions.
 - `continuity`: `reference`, `rolling`, or `reset`. Use `reference` for stable actors; try `rolling` for tighter same-actor continuity across lines.
 - `mix.humanize`: Splits longer lines into phrase-level takes so pauses happen on the timeline instead of hoping the model reads punctuation naturally.
 - `mix.actor_warmup`: Renders a hidden calibration take for each actor and uses it as prompt context. This often helps move built-in narrator voices toward casual film dialogue.
