@@ -883,6 +883,11 @@ def apply_clip_shape(wav: Any, sample_rate: int, *, gain_db: float, fade_ms: int
 def synthetic_nonverbal(kind: str, *, sample_rate: int, duration_ms: int | None) -> Any:
     import numpy as np
 
+    def sine_envelope(length: int, power: float = 1.0) -> Any:
+        values = np.sin(np.linspace(0.0, np.pi, length, dtype=np.float32))
+        values = np.clip(values, 0.0, 1.0)
+        return values**power
+
     normalized = kind.strip().lower().replace("-", "_")
     default_ms = {
         "breath": 360,
@@ -898,32 +903,62 @@ def synthetic_nonverbal(kind: str, *, sample_rate: int, duration_ms: int | None)
 
     length = max(1, int(sample_rate * (duration_ms or default_ms) / 1000))
     rng = np.random.default_rng(abs(hash((normalized, length))) % (2**32))
+    t = np.arange(length, dtype=np.float32) / sample_rate
 
     if normalized in {"mouth_click", "click"}:
         wav = np.zeros(length, dtype=np.float32)
-        burst = min(length, max(12, int(sample_rate * 0.012)))
-        envelope = np.linspace(1.0, 0.0, burst, dtype=np.float32) ** 2
-        wav[:burst] = rng.normal(0, 0.018, burst).astype(np.float32) * envelope
+        burst = min(length, max(24, int(sample_rate * 0.018)))
+        envelope = np.linspace(1.0, 0.0, burst, dtype=np.float32) ** 2.6
+        wav[:burst] = rng.normal(0, 0.22, burst).astype(np.float32) * envelope
+        tick = min(length, int(sample_rate * 0.003))
+        if tick > 1:
+            wav[:tick] += np.sin(np.linspace(0, np.pi * 8, tick, dtype=np.float32)) * 0.12
+        return wav
+
+    if normalized == "swallow":
+        wav = np.zeros(length, dtype=np.float32)
+        thump = np.sin(2 * np.pi * 95 * t) * np.exp(-t * 15.0) * 0.10
+        throat = rng.normal(0, 1.0, length).astype(np.float32)
+        kernel = np.ones(max(8, int(sample_rate * 0.004)), dtype=np.float32)
+        kernel /= kernel.sum()
+        throat = np.convolve(throat, kernel, mode="same").astype(np.float32)
+        envelope = sine_envelope(length, 0.45)
+        wav += thump + throat * envelope * 0.18
+        click_offset = min(length - 1, int(sample_rate * 0.08))
+        click = synthetic_nonverbal("mouth_click", sample_rate=sample_rate, duration_ms=70) * 0.70
+        end = min(length, click_offset + len(click))
+        wav[click_offset:end] += click[: end - click_offset]
         return wav
 
     noise = rng.normal(0, 1.0, length).astype(np.float32)
-    smoothing = max(8, int(sample_rate * 0.006))
+    smoothing = max(8, int(sample_rate * 0.0015))
     kernel = np.ones(smoothing, dtype=np.float32) / smoothing
     wav = np.convolve(noise, kernel, mode="same").astype(np.float32)
-    envelope = np.sin(np.linspace(0.0, np.pi, length, dtype=np.float32))
 
     if normalized in {"breath", "inhale"}:
-        level = 0.010
-    elif normalized in {"exhale", "sigh"}:
-        level = 0.014
+        envelope = np.linspace(0.15, 1.0, length, dtype=np.float32)
+        envelope *= np.linspace(1.0, 0.55, length, dtype=np.float32)
+        level = 0.42 if normalized == "inhale" else 0.36
+    elif normalized == "exhale":
+        envelope = np.linspace(1.0, 0.15, length, dtype=np.float32) ** 0.85
+        level = 0.44
+    elif normalized == "sigh":
+        envelope = sine_envelope(length, 0.35)
+        voiced = np.sin(2 * np.pi * 170 * t) * np.exp(-t * 2.4) * 0.07
+        return wav * envelope * 0.34 + voiced
     else:
-        level = 0.008
+        envelope = sine_envelope(length)
+        level = 0.22
 
     return wav * envelope * level
 
 
 def add_mouth_click(output: Any, *, sample_rate: int, start_sample: int, level: float) -> None:
-    click = synthetic_nonverbal("mouth_click", sample_rate=sample_rate, duration_ms=80) * (level / 0.018)
+    import numpy as np
+
+    click = synthetic_nonverbal("mouth_click", sample_rate=sample_rate, duration_ms=80)
+    peak = float(np.max(np.abs(click))) or 1.0
+    click = (click / peak) * level
     position = max(0, start_sample - int(sample_rate * 0.055))
     end = min(len(output), position + len(click))
     if end > position:
@@ -976,21 +1011,22 @@ def mix_performance_segments(
     mouth_level = 0.0
     if mouth_noises == "subtle":
         mouth_probability = 0.22
-        mouth_level = 0.010
+        mouth_level = 0.055
     elif mouth_noises == "medium":
         mouth_probability = 0.42
-        mouth_level = 0.014
+        mouth_level = 0.095
 
     cursor_ms = 0
     timeline: list[tuple[int, int, RenderedPerformanceSegment, Any]] = []
     metadata: list[dict[str, Any]] = []
     for rendered in rendered_segments:
         segment = rendered.segment
+        clip_fade_ms = min(crossfade_ms, 12) if segment.nonverbal and not segment.text else crossfade_ms
         wav = apply_clip_shape(
             rendered.wav,
             sample_rate,
             gain_db=segment.gain_db,
-            fade_ms=crossfade_ms,
+            fade_ms=clip_fade_ms,
         )
         duration_ms = int(round(len(wav) * 1000 / sample_rate))
         if segment.start_ms is not None:
