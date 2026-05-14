@@ -455,12 +455,13 @@ def generate_audio_with_features(
     text: str,
     args: argparse.Namespace,
     prompt_cache: dict[str, Any] | None = None,
+    apply_voice_prompt: bool = True,
 ) -> tuple[Any, str, Any | None]:
     text = normalize_text(text)
     if not text:
         raise ValueError("Text is empty.")
 
-    target_text = voice.prompt(text)
+    target_text = voice.prompt(text) if apply_voice_prompt else text
     if hasattr(model.tts_model, "generate_with_prompt_cache"):
         wav, _, audio_feat = model.tts_model.generate_with_prompt_cache(
             target_text=target_text,
@@ -727,6 +728,22 @@ def performance_segment_voice(actor_voice: Voice, segment: PerformanceSegment) -
     )
 
 
+def performance_prompt_mode(payload: dict[str, Any]) -> str:
+    mode = normalize_text(str(payload.get("prompt_mode") or "off")).lower()
+    aliases = {
+        "false": "off",
+        "none": "off",
+        "dialogue": "off",
+        "true": "beat",
+        "directions": "beat",
+        "acting": "beat",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"off", "voice", "beat"}:
+        raise ValueError("prompt_mode must be off, voice, or beat.")
+    return mode
+
+
 def render_performance_preview(context: HttpContext, payload: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     import numpy as np
 
@@ -735,6 +752,7 @@ def render_performance_preview(context: HttpContext, payload: dict[str, Any]) ->
     continuity = normalize_text(str(payload.get("continuity") or "rolling")).lower()
     if continuity not in {"rolling", "reference", "reset"}:
         raise ValueError("continuity must be rolling, reference, or reset.")
+    prompt_mode = performance_prompt_mode(payload)
 
     output_path = http_output_path(payload.get("filename"))
     sample_rate = context.model.tts_model.sample_rate
@@ -755,7 +773,9 @@ def render_performance_preview(context: HttpContext, payload: dict[str, Any]) ->
             else:
                 prompt_cache = None
 
-            segment_voice = performance_segment_voice(actor_voice, segment)
+            segment_voice = actor_voice
+            if prompt_mode == "beat":
+                segment_voice = performance_segment_voice(actor_voice, segment)
             print(
                 f"HTTP performance segment {index}/{len(segments)} with {actor_voice.name}",
                 file=sys.stderr,
@@ -766,6 +786,7 @@ def render_performance_preview(context: HttpContext, payload: dict[str, Any]) ->
                 text=segment.text,
                 args=context.args,
                 prompt_cache=prompt_cache,
+                apply_voice_prompt=prompt_mode != "off",
             )
             chunks.append(np.asarray(wav, dtype=np.float32))
 
@@ -809,6 +830,7 @@ def render_performance_preview(context: HttpContext, payload: dict[str, Any]) ->
         {
             "actor": voice_metadata(actor_voice.name, actor_voice),
             "continuity": continuity,
+            "prompt_mode": prompt_mode,
             "segments": segment_metadata,
         },
     )
@@ -1011,7 +1033,7 @@ def start_http_server(context: HttpContext, port: int) -> ThreadingHTTPServer:
         file=sys.stderr,
     )
     print(
-        'POST /perform/preview with JSON: {"actor":{"voice":"friendly_support","identity":"naturalistic film actor"},"segments":[{"text":"Please.","direction":"whispered, afraid","pause_after_ms":700}]}',
+        'POST /perform/preview with JSON: {"actor":{"voice":"friendly_support","identity":"naturalistic film actor"},"segments":[{"text":"Please.","direction":"whispered, afraid","pause_after_ms":700}],"prompt_mode":"off"}',
         file=sys.stderr,
     )
     return server
